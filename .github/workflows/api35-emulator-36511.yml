@@ -1,0 +1,156 @@
+name: API35 Emulator 36.5.11 Boot Proof
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/api35-emulator-36511.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  emulator-36511-boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Host and KVM evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          uname -a | tee evidence/uname.txt
+          free -h | tee evidence/memory-before.txt
+          df -h | tee evidence/disk-before.txt
+          printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" | tee evidence/android-env.txt
+          ls -l /dev/kvm | tee evidence/kvm-before.txt
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm | tee evidence/kvm-after.txt
+          sudo apt-get update
+          sudo apt-get install -y libpulse0
+          ldconfig -p | grep 'libpulse.so.0' | tee evidence/libpulse-runtime.txt
+
+      - name: Download exact Emulator 36.5.11
+        shell: bash
+        run: |
+          set -euxo pipefail
+          archive="$RUNNER_TEMP/emulator-linux_x64-15261927.zip"
+          root="$RUNNER_TEMP/emulator-36.5.11"
+          url='https://dl.google.com/android/repository/emulator-linux_x64-15261927.zip'
+          curl --fail --location --retry 3 --output "$archive" "$url"
+          sha256sum "$archive" | tee evidence/emulator-archive-sha256.txt
+          rm -rf "$root"
+          mkdir -p "$root"
+          unzip -q "$archive" -d "$root"
+          emu="$root/emulator/emulator"
+          test -x "$emu"
+          "$emu" -version 2>&1 | tee evidence/emulator-version.txt
+          grep -F 'Android emulator version 36.5.11.0' evidence/emulator-version.txt
+          "$emu" -accel-check 2>&1 | tee evidence/accel-check.txt
+          grep -F 'KVM' evidence/accel-check.txt
+          printf 'EMULATOR_BIN=%s\n' "$emu" >> "$GITHUB_ENV"
+
+      - name: Android SDK tool evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          test -x "$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdk_root/cmdline-tools/latest/bin/avdmanager"
+          test -x "$sdk_root/platform-tools/adb"
+          "$sdk_root/cmdline-tools/latest/bin/sdkmanager" --version 2>&1 | tee evidence/sdkmanager-version.txt
+          "$sdk_root/platform-tools/adb" version 2>&1 | tee evidence/adb-version.txt
+
+      - name: Install API35 x86_64 system image
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          sdkmanager_bin="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager_bin" --licenses >/dev/null 2>&1 || true
+          "$sdkmanager_bin" "system-images;android-35;default;x86_64" 2>&1 | tee evidence/system-image-install.txt
+          "$sdkmanager_bin" --list_installed 2>&1 | tee evidence/sdk-installed.txt
+          grep -F "system-images;android-35;default;x86_64" evidence/sdk-installed.txt
+
+      - name: Create deterministic fresh AVD
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          avdmanager_bin="$sdk_root/cmdline-tools/latest/bin/avdmanager"
+          avd_home="$RUNNER_TEMP/android-avd-36511"
+          avd_dir="$avd_home/ai-friend-proof.avd"
+          rm -rf "$avd_home"
+          mkdir -p "$avd_home"
+          export ANDROID_AVD_HOME="$avd_home"
+          echo "ANDROID_AVD_HOME=$avd_home" >> "$GITHUB_ENV"
+          echo no | "$avdmanager_bin" create avd --force -n ai-friend-proof -k "system-images;android-35;default;x86_64" --device pixel_6 -p "$avd_dir" 2>&1 | tee evidence/avd-create.txt
+          "$avdmanager_bin" list avd 2>&1 | tee evidence/avd-list.txt
+          test -f "$avd_dir/config.ini"
+          cp "$avd_dir/config.ini" evidence/avd-config.ini
+
+      - name: Boot exact Emulator 36.5.11
+        shell: bash
+        run: |
+          set -uo pipefail
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          adb_bin="$sdk_root/platform-tools/adb"
+          avd_dir="$ANDROID_AVD_HOME/ai-friend-proof.avd"
+          printf '%s\n' "$EMULATOR_BIN -avd ai-friend-proof -no-window -gpu swiftshader -noaudio -no-boot-anim -no-snapshot -no-metrics -accel on" | tee evidence/emulator-launch-command.txt
+          "$adb_bin" start-server >evidence/adb-start.txt 2>&1
+          "$EMULATOR_BIN" -avd ai-friend-proof -no-window -gpu swiftshader -noaudio -no-boot-anim -no-snapshot -no-metrics -accel on >evidence/emulator-boot.log 2>&1 &
+          emu_pid=$!
+          echo "$emu_pid" > evidence/emulator-pid.txt
+
+          snapshot() {
+            "$adb_bin" devices -l > evidence/adb-devices.txt 2>&1 || true
+            ps -ef > evidence/processes.txt 2>&1 || true
+            free -h > evidence/memory-after.txt 2>&1 || true
+            df -h > evidence/disk-after.txt 2>&1 || true
+            cp "$avd_dir/config.ini" evidence/avd-config-after.ini 2>/dev/null || true
+          }
+
+          ready=0
+          for i in $(seq 1 180); do
+            if ! kill -0 "$emu_pid" 2>/dev/null; then
+              wait "$emu_pid"
+              rc=$?
+              echo "EMULATOR_36511_EXITED_BEFORE_BOOT rc=$rc iteration=$i" | tee evidence/result.txt
+              snapshot
+              tail -200 evidence/emulator-boot.log || true
+              exit 41
+            fi
+            state="$(timeout 8s "$adb_bin" get-state 2>/dev/null | tr -d '\r' || true)"
+            boot="$(timeout 8s "$adb_bin" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+            printf 'iteration=%s state=%s boot=%s\n' "$i" "$state" "$boot" >> evidence/boot-poll.txt
+            if [ "$state" = device ] && [ "$boot" = 1 ]; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+
+          snapshot
+          if [ "$ready" -ne 1 ]; then
+            echo 'EMULATOR_36511_BOOT_TIMEOUT' | tee evidence/result.txt
+            tail -200 evidence/emulator-boot.log || true
+            exit 42
+          fi
+          "$adb_bin" shell pm path android > evidence/package-manager.txt 2>&1
+          echo 'EMULATOR_36511_BOOT_OBSERVED' | tee evidence/result.txt
+          "$adb_bin" emu kill >/dev/null 2>&1 || true
+          wait "$emu_pid" 2>/dev/null || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api35-emulator-36511-evidence
+          path: evidence/
+          if-no-files-found: warn
