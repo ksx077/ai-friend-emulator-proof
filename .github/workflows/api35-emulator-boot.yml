@@ -1,0 +1,119 @@
+name: API35 Emulator Boot Proof
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  emulator-boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Host evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p evidence
+          uname -a | tee evidence/uname.txt
+          free -h | tee evidence/memory-before.txt
+          df -h | tee evidence/disk-before.txt
+          ls -l /dev/kvm | tee evidence/kvm-before.txt
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm | tee evidence/kvm-after.txt
+
+      - name: Android tool evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          emulator -version 2>&1 | tee evidence/emulator-version.txt
+          adb version 2>&1 | tee evidence/adb-version.txt
+          emulator -accel-check 2>&1 | tee evidence/accel-check.txt
+          sdkmanager --version 2>&1 | tee evidence/sdkmanager-version.txt
+
+      - name: Install API35 x86_64 image
+        shell: bash
+        run: |
+          set -euxo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "system-images;android-35;default;x86_64" 2>&1 | tee evidence/system-image-install.txt
+          sdkmanager --list_installed 2>&1 | tee evidence/sdk-installed.txt
+          grep -F "system-images;android-35;default;x86_64" evidence/sdk-installed.txt
+
+      - name: Create fresh AVD
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf "$HOME/.android/avd/ai-friend-proof.avd" "$HOME/.android/avd/ai-friend-proof.ini" || true
+          echo no | avdmanager create avd --force -n ai-friend-proof -k "system-images;android-35;default;x86_64" --device pixel_6 2>&1 | tee evidence/avd-create.txt
+          test -f "$HOME/.android/avd/ai-friend-proof.avd/config.ini"
+          cp "$HOME/.android/avd/ai-friend-proof.avd/config.ini" evidence/avd-config.ini
+
+      - name: Boot emulator
+        id: boot
+        shell: bash
+        run: |
+          set -uo pipefail
+          launch='emulator -avd ai-friend-proof -no-window -gpu swiftshader -noaudio -no-boot-anim -no-snapshot -no-metrics -accel on'
+          printf '%s\n' "$launch" | tee evidence/emulator-launch-command.txt
+          adb start-server >evidence/adb-start.txt 2>&1
+          bash -lc "$launch" >evidence/emulator-boot.log 2>&1 &
+          emu_pid=$!
+          echo "$emu_pid" > evidence/emulator-pid.txt
+
+          cleanup_snapshot() {
+            adb devices -l > evidence/adb-devices.txt 2>&1 || true
+            ps -ef > evidence/processes.txt 2>&1 || true
+            free -h > evidence/memory-after.txt 2>&1 || true
+            df -h > evidence/disk-after.txt 2>&1 || true
+            cp "$HOME/.android/avd/ai-friend-proof.avd/config.ini" evidence/avd-config-after.ini 2>/dev/null || true
+          }
+
+          ready=0
+          rc=0
+          for i in $(seq 1 180); do
+            if ! kill -0 "$emu_pid" 2>/dev/null; then
+              wait "$emu_pid"
+              rc=$?
+              echo "EMULATOR_EXITED_BEFORE_BOOT rc=$rc iteration=$i" | tee evidence/result.txt
+              cleanup_snapshot
+              tail -200 evidence/emulator-boot.log || true
+              exit 41
+            fi
+            state="$(timeout 8s adb get-state 2>/dev/null | tr -d '\r' || true)"
+            boot="$(timeout 8s adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r' || true)"
+            printf 'iteration=%s state=%s boot=%s\n' "$i" "$state" "$boot" >> evidence/boot-poll.txt
+            if [ "$state" = "device" ] && [ "$boot" = "1" ]; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+
+          cleanup_snapshot
+          if [ "$ready" -ne 1 ]; then
+            echo "EMULATOR_BOOT_TIMEOUT" | tee evidence/result.txt
+            tail -200 evidence/emulator-boot.log || true
+            exit 42
+          fi
+
+          adb shell pm path android > evidence/package-manager.txt 2>&1
+          echo "EMULATOR_BOOT_OBSERVED" | tee evidence/result.txt
+          adb emu kill >/dev/null 2>&1 || true
+          wait "$emu_pid" 2>/dev/null || true
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api35-emulator-boot-evidence
+          path: evidence/
+          if-no-files-found: warn
