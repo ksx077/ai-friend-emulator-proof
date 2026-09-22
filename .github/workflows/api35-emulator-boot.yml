@@ -24,7 +24,9 @@ jobs:
           uname -a | tee evidence/uname.txt
           free -h | tee evidence/memory-before.txt
           df -h | tee evidence/disk-before.txt
-          printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\n' "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" | tee evidence/android-env.txt
+          printf 'ANDROID_HOME=%s\nANDROID_SDK_ROOT=%s\nANDROID_AVD_HOME=%s\nANDROID_USER_HOME=%s\nANDROID_EMULATOR_HOME=%s\n' \
+            "${ANDROID_HOME:-}" "${ANDROID_SDK_ROOT:-}" "${ANDROID_AVD_HOME:-}" \
+            "${ANDROID_USER_HOME:-}" "${ANDROID_EMULATOR_HOME:-}" | tee evidence/android-env.txt
           ls -l /dev/kvm | tee evidence/kvm-before.txt
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
@@ -82,10 +84,18 @@ jobs:
           set -euxo pipefail
           sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           avdmanager_bin="$sdk_root/cmdline-tools/latest/bin/avdmanager"
-          rm -rf "$HOME/.android/avd/ai-friend-proof.avd" "$HOME/.android/avd/ai-friend-proof.ini" || true
-          echo no | "$avdmanager_bin" create avd --force -n ai-friend-proof -k "system-images;android-35;default;x86_64" --device pixel_6 2>&1 | tee evidence/avd-create.txt
-          test -f "$HOME/.android/avd/ai-friend-proof.avd/config.ini"
-          cp "$HOME/.android/avd/ai-friend-proof.avd/config.ini" evidence/avd-config.ini
+          avd_home="$RUNNER_TEMP/android-avd"
+          avd_dir="$avd_home/ai-friend-proof.avd"
+          rm -rf "$avd_home"
+          mkdir -p "$avd_home"
+          export ANDROID_AVD_HOME="$avd_home"
+          echo "ANDROID_AVD_HOME=$avd_home" >> "$GITHUB_ENV"
+          printf 'ANDROID_AVD_HOME=%s\nAVD_DIR=%s\n' "$ANDROID_AVD_HOME" "$avd_dir" | tee evidence/avd-path.txt
+          echo no | "$avdmanager_bin" create avd --force -n ai-friend-proof -k "system-images;android-35;default;x86_64" --device pixel_6 -p "$avd_dir" 2>&1 | tee evidence/avd-create.txt
+          "$avdmanager_bin" list avd 2>&1 | tee evidence/avd-list.txt
+          find "$avd_home" -maxdepth 3 -print | sort | tee evidence/avd-files.txt
+          test -f "$avd_dir/config.ini"
+          cp "$avd_dir/config.ini" evidence/avd-config.ini
 
       - name: Boot emulator
         id: boot
@@ -95,8 +105,9 @@ jobs:
           sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
           emulator_bin="$sdk_root/emulator/emulator"
           adb_bin="$sdk_root/platform-tools/adb"
+          avd_dir="$ANDROID_AVD_HOME/ai-friend-proof.avd"
           launch="$emulator_bin -avd ai-friend-proof -no-window -gpu swiftshader -noaudio -no-boot-anim -no-snapshot -no-metrics -accel on"
-          printf '%s\n' "$launch" | tee evidence/emulator-launch-command.txt
+          printf 'ANDROID_AVD_HOME=%s\n%s\n' "$ANDROID_AVD_HOME" "$launch" | tee evidence/emulator-launch-command.txt
           "$adb_bin" start-server >evidence/adb-start.txt 2>&1
           bash -lc "$launch" >evidence/emulator-boot.log 2>&1 &
           emu_pid=$!
@@ -107,7 +118,7 @@ jobs:
             ps -ef > evidence/processes.txt 2>&1 || true
             free -h > evidence/memory-after.txt 2>&1 || true
             df -h > evidence/disk-after.txt 2>&1 || true
-            cp "$HOME/.android/avd/ai-friend-proof.avd/config.ini" evidence/avd-config-after.ini 2>/dev/null || true
+            cp "$avd_dir/config.ini" evidence/avd-config-after.ini 2>/dev/null || true
           }
 
           ready=0
